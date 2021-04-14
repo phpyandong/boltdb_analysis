@@ -22,17 +22,25 @@ type txid uint64
 // them. Pages can not be reclaimed by the writer until no more transactions
 // are using them. A long running read transaction can cause the database to
 // quickly grow.
+// Tx表示数据库上的只读或读/写事务。
+//只读事务可以用于检索键值和创建游标。
+//读/写事务可以创建和删除桶，也可以创建和删除密钥。
+//
+// IMPORTANT:你必须提交或回滚事务，当你完成它们。
+//在没有更多的事务使用页面之前，写程序不能回收页面。
+//长时间运行的读事务会导致数据库快速增长。
 // boltdb的事务数据结构，在boltdb中，全部的对数据的操作必须发生在一个事务之内，boltdb的并发读取都在此实现
 type Tx struct {
 	writable       bool             // 指示是否是可读写的transaction
-	managed        bool             // 指示当前transaction是否被db托管，即通过db.Update()或者db.View()来写或者读数据库。
+	managed        bool             // 指示当前transaction是否被db托管，
+									// 即通过db.Update()或者db.View()来写或者读数据库。
 	                                // 因为BoltDB还支持直接调用Tx的相关方法进行读写，这时managed字段为false;
 	db             *DB              // 指向当前db对象
-	meta           *meta            // transaction初始化时从db中数到的meta信息
+	meta           *meta            // transaction初始化时从db中读到的meta信息
 	root           Bucket           // transaction的根Bucket,所有的transaction均从根Bucket开始进行查找
 	pages          map[pgid]*page   // 当前transaction读或写的page
 	stats          TxStats          // 与transaction操作统计相关
-	commitHandlers []func()         // transaction在Commit时的回调函数
+	commitHandlers []func()         // transaction在Commit时的回调函数；可以做一些事务完成后的一些操作，
 
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
 	// Tx opens the database file with the specified flag to copy the data.
@@ -40,10 +48,21 @@ type Tx struct {
 	// By default, the flag is unset, which works well for mostly in-memory
 	// workloads. For databases that are much larger than available RAM,
 	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
+	// WriteFlag为写相关的方法(如WriteTo())指定标志。
+	// Tx使用指定的标志打开数据库文件复制数据。
+	//
+	//默认情况下，该标志是未设置的，这对于大部分内存工作很好
+	//工作负载。对于比可用RAM大得多的数据库，
+	//设置系统调用标志。O_DIRECT以避免丢弃页面缓存。
 	WriteFlag int                   // 复制或移动数据库文件时，指定的文件打开模式
 }
 
 // init initializes the transaction.
+// init初始化事务，仅仅是做个备份
+// 1 、因为事务就是保证为 需要操作的数据，做一个备份，
+// 2 、然后在备份上进行修改,
+// 3 、最后提交事务的时候，才将 tx 上备份的数据保存到 bucket 中的node 。
+// 4 、继而保存到硬盘page
 func (tx *Tx) init(db *DB) {
 	// 将tx.db初始化为传入的db，将tx.pages初始化为空
 	tx.db = db
@@ -63,30 +82,35 @@ func (tx *Tx) init(db *DB) {
 	/*
 	在没有介绍Bucket之前，这里稍微有点不好理解，简单地说，Bucket包括头部(bucket)和一些正文字段，
 	头部(bucket)中包括了Bucket的根节点所在的页的页号和一个序列号，
-	所以tx.init()中对tx.root的初始化其实主要就是将meta中存的根Bucket(它也是整个db的根Bucket)的头部(bucket)拷贝给当前transaction的根Bucket
+	所以tx.init()中对tx.root的初始化其实主要就是将meta中存的根Bucket
+	(它也是整个db的根Bucket)的头部(bucket)拷贝给当前transaction的根Bucket
 	 */
-	*tx.root.bucket = tx.meta.root
+	*tx.root.bucket = tx.meta.root //简单说就是将 meta bucket 数据 转移到tx里进行备份
 
 	// Increment the transaction id and add a page cache for writable transactions.
-	// 如果是可读写的transaction，就将meta中的txid加1，当可读写transaction commit之后，meta就会更新到数据库文件中，
+	// 如果是可读写的transaction，就将meta中的txid加1，当可读写transaction commit之后
+	// meta就会更新到数据库文件中，
 	// 数据库的修改版本号就增加了。
-	if tx.writable {
-		tx.pages = make(map[pgid]*page)  // 再搞一个page cache
+	if tx.writable {//可读
+		tx.pages = make(map[pgid]*page)  // 再搞一个空的page  cache
 		tx.meta.txid += txid(1)  // txid自增1
 	}
 }
 
 // ID returns the transaction id.
+// ID返回事务ID。
 func (tx *Tx) ID() int {
 	return int(tx.meta.txid)  // 专门弄了一个meta结构
 }
 
 // DB returns a reference to the database that created the transaction.
+// DB返回一个对创建事务的数据库的引用。
 func (tx *Tx) DB() *DB {
 	return tx.db
 }
 
 // Size returns current database size in bytes as seen by this transaction.
+// Size返回当前数据库大小，以字节为单位。
 func (tx *Tx) Size() int64 {
 	// Size() = tx.meta.pgid * tx.db.pageSize
 	return int64(tx.meta.pgid) * int64(tx.db.pageSize)
@@ -168,7 +192,8 @@ func (tx *Tx) OnCommit(fn func()) {
 // called on a read-only transaction.
 // 1.从根Bucket开始，对访问过的Bucket进行合并和分裂，让进行过插入和删除操作的B+树重新达到平衡状态；
 // 2.更新freeList页；
-// 3.将由当前Transaction分配的页缓存写入磁盘，需要分配页缓存的地方有：a.节点分裂时产生新的节点；b.freeList页重新分配
+// 3.将由当前Transaction分配的页缓存写入磁盘，需要分配页缓存的地方有：
+//	a.节点分裂时产生新的节点；b.freeList页重新分配
 // 4.将meta页写入磁盘
 func (tx *Tx) Commit() error {
 	// tx.managed必须为false
@@ -184,8 +209,10 @@ func (tx *Tx) Commit() error {
 	// Rebalance nodes which have had deletions.
 	var startTime = time.Now()
 	// 对根Bucket进行再平衡，这里的根Bucket也是整个DB的根Bucket
-	// 然而从根Bucket进行再平衡并不是对DB所有节点进行操作，而是对当前读写Transaction访问过的Bucket中的有删除操作的节点进行再平衡
+	// 然而从根Bucket进行再平衡并不是对DB所有节点进行操作，
+	// 而是对当前读写Transaction访问过的Bucket中的有删除操作的节点进行再平衡
 	tx.root.rebalance()
+
 	if tx.stats.Rebalance > 0 {
 		tx.stats.RebalanceTime += time.Since(startTime)  // 更新rebalance操作的耗时
 	}
@@ -208,11 +235,13 @@ func (tx *Tx) Commit() error {
 	// Free the freelist and allocate new pages for it. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
 	// 释放tx.db.freelist.free的txid为tx.meta.txid，到tx.db.page(tx.meta.freelist)
-	// 更新db的freelist page，作了先释放后重新分配页框并写入的操作，因为在下面tx.write写磁盘的时候，只会向磁盘写入由当前Transaction
-	// 分配并写入过的脏页，由于freelist最初是在db初始化过程中分配的页，如果不在transaction内部释放并重新分配，那么freelist Page将没有
+	// 更新db的freelist page，作了先释放后重新分配页框并写入的操作，因为在下面tx.write写磁盘的时候，
+	//只会向磁盘写入由当前Transaction
+	// 分配并写入过的脏页，由于freelist最初是在db初始化过程中分配的页，
+	//如果不在transaction内部释放并重新分配，那么freelist Page将没有
 	// 机会被更新到DB文件中。
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
-	// 分配回相应的页数
+	// 分配回相应的页数,得到一些内存块
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
 		// 分配失败，回滚
@@ -220,7 +249,7 @@ func (tx *Tx) Commit() error {
 		return err
 	}
 	if err := tx.db.freelist.write(p); err != nil {
-		// tx.db.freelist的内容写入p失败，回滚
+		// tx.db.freelist的内容写入内存块失败，回滚
 		tx.rollback()
 		return err
 	}
@@ -311,7 +340,8 @@ func (tx *Tx) Rollback() error {
 	tx.rollback()
 	return nil
 }
-
+//回滚的 操作就是将 tx上的数据清空。
+//将tx 的db freelist 中txid 对应的pages 页干掉，释放freelist
 func (tx *Tx) rollback() {
 	if tx.db == nil {
 		return
@@ -335,13 +365,13 @@ func (tx *Tx) close() {
 
 		// Remove transaction ref & writer lock.
 		tx.db.rwtx = nil
-		tx.db.rwlock.Unlock()  // 读写锁解锁
+		tx.db.rwlock.Unlock()  // 读写锁解锁  将tx 上对应的db的锁 unlock
 
 		// Merge statistics.
 		// 记录Stats
 		tx.db.statlock.Lock()
-		tx.db.stats.FreePageN = freelistFreeN
-		tx.db.stats.PendingPageN = freelistPendingN
+		tx.db.stats.FreePageN = freelistFreeN //释放的freelist 个数
+		tx.db.stats.PendingPageN = freelistPendingN  //准备释放的freelist
 		tx.db.stats.FreeAlloc = (freelistFreeN + freelistPendingN) * tx.db.pageSize
 		tx.db.stats.FreelistInuse = freelistAlloc
 		tx.db.stats.TxStats.add(&tx.stats)
@@ -370,6 +400,8 @@ func (tx *Tx) Copy(w io.Writer) error {
 
 // WriteTo writes the entire database to a writer.
 // If err == nil then exactly tx.Size() bytes will be written into the writer.
+//WriteTo将整个数据库写入一个写入器。
+//如果err == nil，则精确地将tx.Size()字节写入写入器。
 func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 	// Attempt to open reader with WriteFlag
 	// 打开一个文件
@@ -478,6 +510,7 @@ func (tx *Tx) check(ch chan error) {
 	tx.checkBucket(&tx.root, reachable, freed, ch)
 
 	// Ensure all pages below high water mark are either reachable or freed.
+	//确保所有低于最高水位的页面都是可访问的或已释放的
 	for i := pgid(0); i < tx.meta.pgid; i++ {
 		_, isReachable := reachable[i]
 		if !isReachable && !freed[i] {  // 不可达且未被释放
@@ -528,6 +561,7 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
+// allocate返回一个从给定页开始的连续内存块。
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
 	if err != nil {

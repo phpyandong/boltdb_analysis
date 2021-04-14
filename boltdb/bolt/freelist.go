@@ -211,20 +211,23 @@ func (f *freelist) read(p *page) {
 // freelist转page
 func (f *freelist) write(p *page) error {
 	// Combine the old free pgids and pgids waiting on an open transaction.
-
+	//合并旧的空闲pgid和pgid等待一个打开的事务。
 	// Update the header flag.
 	p.flags |= freelistPageFlag
 
 	// The page.count can only hold up to 64k elements so if we overflow that
 	// number then we handle it by putting the size in the first element.
+	//page。count最多只能保存64k （2^16  64 *2^10）个元素
+	//所以如果我们需要溢出这个数 我们可以通过将size放入第一个元素来处理它。
 	lenids := f.count()  // freelist的总数
 	if lenids == 0 {
 		p.count = uint16(lenids)
-	} else if lenids < 0xFFFF {
+	} else if lenids < 0xFFFF { //十进制的65535 2^16
 		p.count = uint16(lenids)  // 赋值
 		f.copyall(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[:])  // 写到p.ptr中
 	} else {
-		p.count = 0xFFFF
+		//如果大于64k ,
+		p.count = 0xFFFF //这里直接将page的count 定位64k
 		((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[0] = pgid(lenids)  // 把长度值写到第一位
 		f.copyall(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[1:])  // 把内容写到p.ptr[1:]中
 	}
